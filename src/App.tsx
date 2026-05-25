@@ -17,6 +17,54 @@ interface HistoryItem {
   timestamp: number;
 }
 
+const HISTORY_STORAGE_KEY = 'osint_history';
+const MAX_HISTORY_ITEMS = 20;
+
+function loadStoredHistory(): HistoryItem[] {
+  try {
+    const saved = localStorage.getItem(HISTORY_STORAGE_KEY);
+    const parsed: unknown = saved ? JSON.parse(saved) : [];
+    return Array.isArray(parsed) ? parsed.slice(0, MAX_HISTORY_ITEMS) as HistoryItem[] : [];
+  } catch (err) {
+    console.warn('Unable to load analysis history:', err);
+    return [];
+  }
+}
+
+function isStorageQuotaError(err: unknown): boolean {
+  return err instanceof DOMException && (
+    err.name === 'QuotaExceededError' ||
+    err.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+    err.code === 22 ||
+    err.code === 1014
+  );
+}
+
+function persistStoredHistory(history: HistoryItem[]): HistoryItem[] {
+  let retained = history.slice(0, MAX_HISTORY_ITEMS);
+
+  while (retained.length > 0) {
+    try {
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(retained));
+      return retained;
+    } catch (err) {
+      if (!isStorageQuotaError(err)) {
+        console.warn('Unable to persist analysis history:', err);
+        return retained;
+      }
+      console.warn('Unable to persist complete analysis history; dropping oldest item:', err);
+      retained = retained.slice(0, -1);
+    }
+  }
+
+  try {
+    localStorage.removeItem(HISTORY_STORAGE_KEY);
+  } catch (err) {
+    console.warn('Unable to clear analysis history storage:', err);
+  }
+  return retained;
+}
+
 function C2paHistoryIcon({ c2pa }: { c2pa?: C2paScanResult }) {
   if (!c2pa || c2pa.status === 'absent' || c2pa.status === 'disabled') {
     return <ShieldOff className="w-3 h-3 text-gray-700 shrink-0" />;
@@ -114,25 +162,30 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [isChatOpen, setIsChatOpen] = useState(false);
   
-  const [history, setHistory] = useState<HistoryItem[]>(() => {
-    const saved = localStorage.getItem('osint_history');
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [history, setHistory] = useState<HistoryItem[]>(loadStoredHistory);
+  const [historyStorageNotice, setHistoryStorageNotice] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'analysis' | 'history'>('analysis');
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('visual');
   const [groundingTool, setGroundingTool] = useState<'search' | 'maps'>('maps');
   const [c2paResult, setC2paResult] = useState<C2paScanResult | null>(null);
   const [c2paScanning, setC2paScanning] = useState(false);
   const c2paScanGeneration = useRef(0);
+  const resultCoordinates = result?.coordinates ?? null;
 
   useEffect(() => {
-    localStorage.setItem('osint_history', JSON.stringify(history));
+    const retained = persistStoredHistory(history);
+    if (retained.length !== history.length) {
+      setHistory(retained);
+      setHistoryStorageNotice('Archive storage is full. Older analyses were discarded.');
+    }
   }, [history]);
 
   useEffect(() => {
     if (result && image) {
-      setMapCenter([result.coordinates.lat, result.coordinates.lng]);
-      setMapZoom(13);
+      if (result.coordinates) {
+        setMapCenter([result.coordinates.lat, result.coordinates.lng]);
+        setMapZoom(13);
+      }
       
       const base64 = image.split(',')[1];
       let mimeType = 'image/jpeg';
@@ -245,7 +298,7 @@ export default function App() {
         c2pa: c2paResult ?? undefined,
         timestamp: Date.now()
       };
-      setHistory(prev => [newItem, ...prev].slice(0, 20)); // Keep last 20
+      setHistory(prev => [newItem, ...prev].slice(0, MAX_HISTORY_ITEMS));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Analysis failed. Please try again.");
     } finally {
@@ -298,7 +351,7 @@ export default function App() {
   };
 
   const handleSourceClick = (source: { uri: string; type: string }, e: React.MouseEvent) => {
-    if (source.type === 'maps' && result) {
+    if (source.type === 'maps' && result?.coordinates) {
       const url = source.uri;
       const coordMatch = url.match(/query=([-+]?\d*\.?\d+),([-+]?\d*\.?\d+)/) || 
                        url.match(/@([-+]?\d*\.?\d+),([-+]?\d*\.?\d+)(?:,(\d+)z)?/) ||
@@ -446,25 +499,30 @@ export default function App() {
                       <div className="flex justify-between items-center">
                         <span className="text-[10px] text-gray-500 font-mono uppercase">Latitude</span>
                         <span className="font-mono text-sm text-cyan-400">
-                          {result ? `${result.coordinates.lat.toFixed(4)}° N` : '---.----'}
+                          {resultCoordinates ? `${resultCoordinates.lat.toFixed(4)}° N` : '---.----'}
                         </span>
                       </div>
                       <div className="flex justify-between items-center">
                         <span className="text-[10px] text-gray-500 font-mono uppercase">Longitude</span>
                         <span className="font-mono text-sm text-cyan-400">
-                          {result ? `${result.coordinates.lng.toFixed(4)}° E` : '---.----'}
+                          {resultCoordinates ? `${resultCoordinates.lng.toFixed(4)}° E` : '---.----'}
                         </span>
                       </div>
-                      {result && (
+                      {result && !resultCoordinates && (
+                        <p className="pt-2 text-[10px] text-amber-500/90 font-mono uppercase">
+                          Location unresolved - no verified map point
+                        </p>
+                      )}
+                      {resultCoordinates && (
                         <div className="flex gap-2 mt-2">
                           <button 
-                            onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${result.coordinates.lat},${result.coordinates.lng}`, '_blank')}
+                            onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${resultCoordinates.lat},${resultCoordinates.lng}`, '_blank')}
                             className="flex-1 py-2 bg-white/5 border border-white/10 rounded text-[10px] text-gray-400 hover:bg-white/10 hover:text-white transition-all uppercase tracking-widest"
                           >
                             Earth View
                           </button>
                           <button 
-                            onClick={() => copyToClipboard(`${result.coordinates.lat}, ${result.coordinates.lng}`)}
+                            onClick={() => copyToClipboard(`${resultCoordinates.lat}, ${resultCoordinates.lng}`)}
                             className="px-3 py-2 bg-white/5 border border-white/10 rounded text-[10px] text-gray-400 hover:bg-white/10 hover:text-white transition-all uppercase tracking-widest flex items-center justify-center"
                             title="Copy Coordinates"
                           >
@@ -626,6 +684,11 @@ export default function App() {
                     <div className="flex items-center justify-between">
                       <label className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Encrypted Archive</label>
                     </div>
+                    {historyStorageNotice && (
+                      <p className="text-[10px] text-amber-500/90 font-mono leading-relaxed">
+                        {historyStorageNotice}
+                      </p>
+                    )}
                     {history.length > 0 && (
                       <button 
                         onClick={() => { if(confirm('Are you sure you want to clear ALL historical records? This action is irreversible.')) setHistory([]) }}
@@ -691,7 +754,7 @@ export default function App() {
             <div className="bg-black/60 backdrop-blur-xl border border-white/10 rounded-xl flex flex-col md:flex-row items-stretch overflow-hidden">
                {/* Map Preview */}
                <div className="w-40 h-40 shrink-0 bg-gray-950 border-r border-white/10 relative overflow-hidden group">
-                  {result ? (
+                  {resultCoordinates ? (
                     <MapContainer 
                       center={mapCenter} 
                       zoom={mapZoom} 
@@ -706,7 +769,7 @@ export default function App() {
                           : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
                         } 
                       />
-                      <Marker position={[result.coordinates.lat, result.coordinates.lng]} />
+                      <Marker position={[resultCoordinates.lat, resultCoordinates.lng]} />
                       {tempMarker && <Marker position={tempMarker} opacity={0.5} />}
                       <MapController center={mapCenter} />
                     </MapContainer>
@@ -716,7 +779,7 @@ export default function App() {
                     </div>
                   )}
                   <div className="absolute bottom-2 left-2 px-2 py-1 bg-black/80 rounded border border-white/10 text-[7px] font-mono text-cyan-400 uppercase tracking-[0.2em] pointer-events-none">
-                    Map_Link: Active
+                    Map_Link: {resultCoordinates ? 'Active' : 'Unavailable'}
                   </div>
                </div>
 

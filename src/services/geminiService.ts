@@ -126,7 +126,7 @@ export interface GeolocationResult {
   coordinates: {
     lat: number;
     lng: number;
-  };
+  } | null;
   confidence: number;
   evidence: string[];
   description: string;
@@ -147,10 +147,13 @@ export function createOsintChatSession(
   result: GeolocationResult,
   c2paContext?: string
 ): ChatSession {
+  const coordinatesContext = result.coordinates
+    ? `${result.coordinates.lat.toFixed(4)}, ${result.coordinates.lng.toFixed(4)}`
+    : "Not verified";
   const systemInstruction = `You are a specialized OSINT (Open Source Intelligence) assistant called "LOCUS" embedded in an analytical engine. 
 The system engine has already processed an image provided by the user with the following findings:
 - Estimated Location: ${result.locationName}
-- Coordinates: ${result.coordinates.lat.toFixed(4)}, ${result.coordinates.lng.toFixed(4)}
+- Coordinates: ${coordinatesContext}
 - Confidence Score: ${(result.confidence * 100).toFixed(1)}%
 - System Heuristic Summary: ${result.description}
 - Identifiable Evidentiary Features: ${result.evidence.join('; ')}
@@ -286,19 +289,7 @@ function normalizeGeolocationResult(raw: unknown): GeolocationResult {
   }
 
   const data = raw as Record<string, unknown>;
-  const coords = data.coordinates;
-
-  if (!coords || typeof coords !== "object") {
-    throw new Error('Missing or invalid "coordinates" field.');
-  }
-
-  const coordRecord = coords as Record<string, unknown>;
-  const lat = Number(coordRecord.lat);
-  const lng = Number(coordRecord.lng);
-
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-    throw new Error('Coordinates must be numeric "lat" and "lng".');
-  }
+  const coordinates = normalizeCoordinates(data);
 
   const toStringArray = (value: unknown): string[] | undefined => {
     if (!Array.isArray(value)) return undefined;
@@ -323,7 +314,7 @@ function normalizeGeolocationResult(raw: unknown): GeolocationResult {
 
   return {
     locationName,
-    coordinates: { lat, lng },
+    coordinates,
     confidence,
     evidence,
     description,
@@ -333,10 +324,61 @@ function normalizeGeolocationResult(raw: unknown): GeolocationResult {
   };
 }
 
+function normalizeCoordinates(data: Record<string, unknown>): GeolocationResult["coordinates"] {
+  const coordinateCandidates: unknown[] = [
+    data.coordinates,
+    data.coordinate,
+    data.location,
+    { lat: data.lat ?? data.latitude, lng: data.lng ?? data.lon ?? data.longitude },
+  ];
+
+  for (const candidate of coordinateCandidates) {
+    if (Array.isArray(candidate) && candidate.length >= 2) {
+      const parsed = toValidCoordinates(candidate[0], candidate[1]);
+      if (parsed) return parsed;
+      continue;
+    }
+
+    if (!candidate || typeof candidate !== "object") continue;
+    const record = candidate as Record<string, unknown>;
+    const parsed = toValidCoordinates(
+      record.lat ?? record.latitude,
+      record.lng ?? record.lon ?? record.longitude
+    );
+    if (parsed) return parsed;
+  }
+
+  return null;
+}
+
+function toValidCoordinates(latValue: unknown, lngValue: unknown): GeolocationResult["coordinates"] {
+  if (
+    latValue == null ||
+    lngValue == null ||
+    (typeof latValue === "string" && !latValue.trim()) ||
+    (typeof lngValue === "string" && !lngValue.trim())
+  ) {
+    return null;
+  }
+  const lat = Number(latValue);
+  const lng = Number(lngValue);
+  if (
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lng) ||
+    lat < -90 ||
+    lat > 90 ||
+    lng < -180 ||
+    lng > 180
+  ) {
+    return null;
+  }
+  return { lat, lng };
+}
+
 export async function geolocateImage(base64Data: string, mimeType: string, mode: AnalysisMode = 'visual', groundingTool: 'search' | 'maps' = 'maps'): Promise<GeolocationResult> {
   let prompt = `Act as an expert OSINT (Open Source Intelligence) analyst specializing in image geolocation.
   Your goal is to determine the precise geographic location shown in the image by following a rigorous evidence-based workflow. Tone should be neutral, skeptical, and strictly evidence-based.
-  Crucial Rule: Do NOT speculate beyond what is visually confirmed in the image. If a feature is not present, explicitly state "Not visible" or use null. Do not guess coordinates unless the location contains verifiable landmarks.
+  Crucial Rule: Do NOT speculate beyond what is visually confirmed in the image. If a feature is not present, explicitly state "Not visible" or use null. Do not guess coordinates unless the location contains verifiable landmarks. When coordinates cannot be verified, return "coordinates": null and "locationName": "Unresolved location".
   
   Meticulously perform the following steps:
   1. DEDICATED OCR & SYMBOL PASS (EXTREME ATTENTION TO DETAIL REQUIRED):
@@ -371,16 +413,16 @@ export async function geolocateImage(base64Data: string, mimeType: string, mode:
   MODE FOCUS: ${mode === 'satellite' ? ' structural layout, road networks, and topography from an overhead view' : mode === 'flora' ? 'botanical signatures, biomes, and climate zones' : 'general visual cues'}.
   
   You MUST respond with ONLY a single raw JSON object — no markdown, no code fences, no commentary before or after.
-  Match this structure exactly:
+  Match this structure exactly. Replace the null coordinates value with { "lat": number, "lng": number } only when verified:
   {
     "locationName": "Precise name (e.g. 123 Main St, Berlin, Germany)",
-    "coordinates": { "lat": number, "lng": number },
+    "coordinates": null,
     "confidence": 0-1,
     "extractedText": ["Literal Text [English Translation] (Font/Style analysis)"],
     "identifiedSymbols": ["Description of symbol"],
     "searchQueriesExecuted": ["Query 1", "Query 2"],
     "evidence": ["e.g. Utility pole design matches Polish Standard...", "e.g. Text is Cyrillic, likely Ukrainian..."],
-    "description": "A detailed step-by-step reasoning of how you arrived at this location, including broad region hypothesis, verification searches steps, resolution of conflicting clues, and why alternative regions were eliminated."
+    "description": "A detailed evidence summary of how you arrived at this location, including broad region hypothesis, verification searches steps, resolution of conflicting clues, and why alternative regions were eliminated. Use null coordinates if no location can be verified."
   }`;
 
   let response: GenerateContentResponse;

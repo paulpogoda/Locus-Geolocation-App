@@ -28,9 +28,9 @@ export default class ErrorBoundary extends Component<Props, State> {
               Interface Error
             </h1>
             <p className="text-xs text-gray-400 leading-relaxed">
-              The UI crashed while rendering results. This is often caused by unexpected C2PA
-              metadata. Reload the page and try again, or set{" "}
-              <code className="text-cyan-400">VITE_C2PA_ENABLED=false</code> in .env.local.
+              The UI could not complete this operation. Reload the page and try again. If this
+              happened after adding an analysis, clear older history entries to free browser
+              storage.
             </p>
             <pre className="text-[10px] font-mono text-red-300/90 bg-black/40 p-3 rounded border border-white/10 overflow-auto max-h-40">
               {this.state.error.message}
