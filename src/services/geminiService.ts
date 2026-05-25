@@ -1,6 +1,125 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, type GenerateContentResponse } from "@google/genai";
+
+const ANALYSIS_MODEL =
+  import.meta.env.VITE_GEMINI_ANALYSIS_MODEL || "gemini-2.5-flash";
+
+const CHAT_MODEL =
+  import.meta.env.VITE_GEMINI_CHAT_MODEL || "gemini-2.5-flash";
+
+const ANALYSIS_FALLBACK_MODELS = (
+  import.meta.env.VITE_GEMINI_ANALYSIS_FALLBACK_MODELS || ""
+)
+  .split(",")
+  .map((model) => model.trim())
+  .filter(Boolean);
+
+const TRANSIENT_RETRY_ATTEMPTS = 3;
+const TRANSIENT_RETRY_BASE_MS = 2000;
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseApiError(error: unknown): {
+  code?: number;
+  status?: string;
+  message: string;
+} {
+  const fallbackMessage =
+    error instanceof Error ? error.message : JSON.stringify(error);
+
+  try {
+    const parsed = JSON.parse(fallbackMessage) as {
+      error?: { code?: number; message?: string; status?: string };
+    };
+    if (parsed.error) {
+      return {
+        code: parsed.error.code,
+        status: parsed.error.status,
+        message: parsed.error.message || fallbackMessage,
+      };
+    }
+  } catch {
+    // Not JSON — use raw message.
+  }
+
+  const err = error as { status?: number | string; code?: number };
+  return {
+    code: typeof err?.status === "number" ? err.status : err?.code,
+    status: typeof err?.status === "string" ? err.status : undefined,
+    message: fallbackMessage,
+  };
+}
+
+function isTransientApiError(error: unknown): boolean {
+  const { code, status, message } = parseApiError(error);
+  if (code === 503 || code === 429) return true;
+  if (status === "UNAVAILABLE" || status === "RESOURCE_EXHAUSTED") return true;
+  return /high demand|try again later|overloaded|rate limit|quota/i.test(message);
+}
+
+function uniqueModels(models: string[]): string[] {
+  return [...new Set(models.filter(Boolean))];
+}
+
+function formatGeminiApiError(
+  error: unknown,
+  modelsTried: string[],
+  groundingTool: string
+): Error {
+  const { code, status, message } = parseApiError(error);
+  const modelList = modelsTried.join(" → ");
+
+  if (code === 503 || status === "UNAVAILABLE") {
+    return new Error(
+      `Gemini is temporarily overloaded (503). Wait a minute and retry, or set VITE_GEMINI_ANALYSIS_FALLBACK_MODELS in .env.local (e.g. gemini-2.0-flash). Models tried: ${modelList}. Tool: ${groundingTool}.`
+    );
+  }
+
+  if (code === 429 || status === "RESOURCE_EXHAUSTED") {
+    return new Error(
+      `Gemini API quota or rate limit exceeded (429). Check billing/limits in Google AI Studio. Model: ${modelsTried[modelsTried.length - 1]}. Tool: ${groundingTool}.`
+    );
+  }
+
+  return new Error(
+    `Failed to call the Gemini API: ${message}. Models tried: ${modelList}. Tool: ${groundingTool}`
+  );
+}
+
+async function generateAnalysisContent(
+  params: Omit<Parameters<typeof ai.models.generateContent>[0], "model">,
+  groundingTool: "search" | "maps"
+): Promise<GenerateContentResponse> {
+  const models = uniqueModels([ANALYSIS_MODEL, ...ANALYSIS_FALLBACK_MODELS]);
+  let lastError: unknown;
+
+  for (const model of models) {
+    for (let attempt = 0; attempt < TRANSIENT_RETRY_ATTEMPTS; attempt++) {
+      try {
+        return await ai.models.generateContent({ ...params, model });
+      } catch (error) {
+        lastError = error;
+        const canRetry =
+          isTransientApiError(error) && attempt < TRANSIENT_RETRY_ATTEMPTS - 1;
+
+        if (canRetry) {
+          await sleep(TRANSIENT_RETRY_BASE_MS * 2 ** attempt);
+          continue;
+        }
+
+        if (!isTransientApiError(error)) {
+          throw formatGeminiApiError(error, models.slice(0, models.indexOf(model) + 1), groundingTool);
+        }
+        break;
+      }
+    }
+  }
+
+  throw formatGeminiApiError(lastError, models, groundingTool);
+}
 
 export interface GeolocationResult {
   locationName: string;
@@ -23,8 +142,6 @@ export interface ChatSession {
 }
 
 export function createOsintChatSession(base64Data: string, mimeType: string, result: GeolocationResult): ChatSession {
-  const model = "gemini-2.5-flash";
-
   const systemInstruction = `You are a specialized OSINT (Open Source Intelligence) assistant called "LOCUS" embedded in an analytical engine. 
 The system engine has already processed an image provided by the user with the following findings:
 - Estimated Location: ${result.locationName}
@@ -38,7 +155,7 @@ When appropriate, carefully reference specific details like architectural styles
 Provide concise, expert, and precise answers. Maintain a professional, detached, and slightly clinical "intelligence analyst" persona.`;
 
   const chat = ai.chats.create({
-    model,
+    model: CHAT_MODEL,
     config: {
       systemInstruction: systemInstruction,
       temperature: 0.3,
@@ -78,9 +195,139 @@ Provide concise, expert, and precise answers. Maintain a professional, detached,
 
 export type AnalysisMode = 'visual' | 'satellite' | 'flora';
 
-export async function geolocateImage(base64Data: string, mimeType: string, mode: AnalysisMode = 'visual', groundingTool: 'search' | 'maps' = 'maps'): Promise<GeolocationResult> {
-  const model = "gemini-2.5-pro"; // Upgraded to Pro for state-of-the-art OCR and reasoning in challenging conditions
+function extractResponseText(response: GenerateContentResponse): string {
+  if (response.text?.trim()) {
+    return response.text.trim();
+  }
 
+  const parts = response.candidates?.[0]?.content?.parts ?? [];
+  return parts
+    .map((part) => ("text" in part && typeof part.text === "string" ? part.text : ""))
+    .join("\n")
+    .trim();
+}
+
+function extractJsonObject(text: string): string | null {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fenced?.[1] ?? text).trim();
+
+  const start = candidate.indexOf("{");
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < candidate.length; i++) {
+    const char = candidate[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === "{") depth++;
+    if (char === "}") {
+      depth--;
+      if (depth === 0) {
+        return candidate.slice(start, i + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+function sanitizeJsonString(json: string): string {
+  return json
+    .replace(/^\uFEFF/, "")
+    .replace(/,\s*([}\]])/g, "$1");
+}
+
+function parseGeolocationJson(text: string): GeolocationResult {
+  const jsonString = extractJsonObject(text);
+  if (!jsonString) {
+    throw new Error("No JSON object found in model response.");
+  }
+
+  const sanitized = sanitizeJsonString(jsonString);
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(sanitized);
+  } catch (parseError) {
+    const message =
+      parseError instanceof Error ? parseError.message : "Invalid JSON syntax";
+    throw new Error(`${message} (response length: ${text.length})`);
+  }
+
+  return normalizeGeolocationResult(parsed);
+}
+
+function normalizeGeolocationResult(raw: unknown): GeolocationResult {
+  if (!raw || typeof raw !== "object") {
+    throw new Error("Parsed value is not a JSON object.");
+  }
+
+  const data = raw as Record<string, unknown>;
+  const coords = data.coordinates;
+
+  if (!coords || typeof coords !== "object") {
+    throw new Error('Missing or invalid "coordinates" field.');
+  }
+
+  const coordRecord = coords as Record<string, unknown>;
+  const lat = Number(coordRecord.lat);
+  const lng = Number(coordRecord.lng);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    throw new Error('Coordinates must be numeric "lat" and "lng".');
+  }
+
+  const toStringArray = (value: unknown): string[] | undefined => {
+    if (!Array.isArray(value)) return undefined;
+    return value.map((item) => String(item));
+  };
+
+  const evidence = toStringArray(data.evidence) ?? [];
+  const confidenceRaw = Number(data.confidence);
+  const confidence = Number.isFinite(confidenceRaw)
+    ? Math.min(1, Math.max(0, confidenceRaw > 1 ? confidenceRaw / 100 : confidenceRaw))
+    : 0;
+
+  const locationName =
+    typeof data.locationName === "string" && data.locationName.trim()
+      ? data.locationName.trim()
+      : "Unknown location";
+
+  const description =
+    typeof data.description === "string" && data.description.trim()
+      ? data.description.trim()
+      : "No description provided.";
+
+  return {
+    locationName,
+    coordinates: { lat, lng },
+    confidence,
+    evidence,
+    description,
+    extractedText: toStringArray(data.extractedText),
+    identifiedSymbols: toStringArray(data.identifiedSymbols),
+    searchQueriesExecuted: toStringArray(data.searchQueriesExecuted),
+  };
+}
+
+export async function geolocateImage(base64Data: string, mimeType: string, mode: AnalysisMode = 'visual', groundingTool: 'search' | 'maps' = 'maps'): Promise<GeolocationResult> {
   let prompt = `Act as an expert OSINT (Open Source Intelligence) analyst specializing in image geolocation.
   Your goal is to determine the precise geographic location shown in the image by following a rigorous evidence-based workflow. Tone should be neutral, skeptical, and strictly evidence-based.
   Crucial Rule: Do NOT speculate beyond what is visually confirmed in the image. If a feature is not present, explicitly state "Not visible" or use null. Do not guess coordinates unless the location contains verifiable landmarks.
@@ -117,7 +364,8 @@ export async function geolocateImage(base64Data: string, mimeType: string, mode:
   
   MODE FOCUS: ${mode === 'satellite' ? ' structural layout, road networks, and topography from an overhead view' : mode === 'flora' ? 'botanical signatures, biomes, and climate zones' : 'general visual cues'}.
   
-  You MUST respond ONLY with a valid JSON object matching this structure exactly:
+  You MUST respond with ONLY a single raw JSON object — no markdown, no code fences, no commentary before or after.
+  Match this structure exactly:
   {
     "locationName": "Precise name (e.g. 123 Main St, Berlin, Germany)",
     "coordinates": { "lat": number, "lng": number },
@@ -129,44 +377,47 @@ export async function geolocateImage(base64Data: string, mimeType: string, mode:
     "description": "A detailed step-by-step reasoning of how you arrived at this location, including broad region hypothesis, verification searches steps, resolution of conflicting clues, and why alternative regions were eliminated."
   }`;
 
-  let response;
+  let response: GenerateContentResponse;
   try {
-    response = await ai.models.generateContent({
-      model,
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              inlineData: {
-                data: base64Data,
-                mimeType: mimeType,
+    response = await generateAnalysisContent(
+      {
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                inlineData: {
+                  data: base64Data,
+                  mimeType: mimeType,
+                },
               },
-            },
-            { text: prompt },
+              { text: prompt },
+            ],
+          },
+        ],
+        config: {
+          // Grounding tools cannot be combined with responseMimeType JSON (API returns 400).
+          tools: [
+            groundingTool === "maps"
+              ? { googleMaps: { enableWidget: true } }
+              : { googleSearch: {} },
           ],
         },
-      ],
-      config: {
-        tools: [groundingTool === 'maps' ? { googleMaps: { enableWidget: true } } : { googleSearch: {} }],
       },
-    });
-  } catch (error: any) {
+      groundingTool
+    );
+  } catch (error) {
     console.error("Gemini API Error details:", error);
-    const errorMessage = error?.message || (typeof error === 'string' ? error : JSON.stringify(error));
-    throw new Error(`Failed to call the Gemini API: ${errorMessage}. Model: ${model}, Tool: ${groundingTool}`);
+    throw error instanceof Error ? error : formatGeminiApiError(error, [ANALYSIS_MODEL], groundingTool);
   }
 
   try {
-    const text = response.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    
-    // Extract JSON from the text response (it might be wrapped in markdown code blocks)
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error("Could not find JSON in response: " + text);
+    const text = extractResponseText(response);
+    if (!text) {
+      throw new Error("Model returned an empty response.");
     }
-    
-    const result = JSON.parse(jsonMatch[0]) as GeolocationResult;
+
+    const result = parseGeolocationJson(text);
     
     // Extract grounding entry point (Web Search HTML widget)
     const groundingMetadata = response.candidates?.[0]?.groundingMetadata;
@@ -206,6 +457,10 @@ export async function geolocateImage(base64Data: string, mimeType: string, mode:
     return result;
   } catch (error) {
     console.error("Failed to parse Gemini response:", error);
-    throw new Error("Could not analyze the image correctly. The AI reached a conclusion but failed to format it as requested.");
+    const detail =
+      error instanceof Error ? error.message : "Unknown parse error";
+    throw new Error(
+      `Could not analyze the image correctly. The AI responded but the result could not be parsed (${detail}). Try again, switch to Web Search grounding, or use a more capable analysis model in .env.local.`
+    );
   }
 }
