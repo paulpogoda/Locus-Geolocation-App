@@ -3,15 +3,31 @@ import { useDropzone } from 'react-dropzone';
 import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import { motion, AnimatePresence } from 'motion/react';
-import { MapPin, Upload, Loader2, Info, ChevronRight, X, Compass, Search, ExternalLink, Globe, Map as MapIcon, Target, Plus, Minus, History, Trash2, Clock, MessageSquare, Send } from 'lucide-react';
+import { MapPin, Upload, Loader2, Info, ChevronRight, X, Compass, Search, ExternalLink, Globe, Map as MapIcon, Target, Plus, Minus, History, Trash2, Clock, MessageSquare, Send, ShieldCheck, ShieldAlert, ShieldOff } from 'lucide-react';
 import { geolocateImage, GeolocationResult, AnalysisMode, createOsintChatSession, ChatSession } from './services/geminiService';
+import { formatC2paContextForChat, getC2paChipLabel, normalizeC2paScanResult, type C2paScanResult } from './services/c2paTypes';
+import C2paCredentialsPanel, { C2paImageBadge } from './components/C2paCredentialsPanel';
 import Markdown from 'react-markdown';
 
 interface HistoryItem {
   id: string;
   image: string;
   result: GeolocationResult;
+  c2pa?: C2paScanResult;
   timestamp: number;
+}
+
+function C2paHistoryIcon({ c2pa }: { c2pa?: C2paScanResult }) {
+  if (!c2pa || c2pa.status === 'absent' || c2pa.status === 'disabled') {
+    return <ShieldOff className="w-3 h-3 text-gray-700 shrink-0" />;
+  }
+  if (c2pa.status === 'present_valid_ai_claimed' || c2pa.status === 'present_unverified') {
+    return <ShieldAlert className="w-3 h-3 text-amber-500 shrink-0" />;
+  }
+  if (c2pa.status === 'present_valid') {
+    return <ShieldCheck className="w-3 h-3 text-cyan-500 shrink-0" />;
+  }
+  return <ShieldAlert className="w-3 h-3 text-red-500/80 shrink-0" />;
 }
 
 // Fix for Leaflet default marker icon
@@ -105,6 +121,9 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'analysis' | 'history'>('analysis');
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('visual');
   const [groundingTool, setGroundingTool] = useState<'search' | 'maps'>('maps');
+  const [c2paResult, setC2paResult] = useState<C2paScanResult | null>(null);
+  const [c2paScanning, setC2paScanning] = useState(false);
+  const c2paScanGeneration = useRef(0);
 
   useEffect(() => {
     localStorage.setItem('osint_history', JSON.stringify(history));
@@ -120,13 +139,15 @@ export default function App() {
       if (image.startsWith('data:image/png')) mimeType = 'image/png';
       else if (image.startsWith('data:image/webp')) mimeType = 'image/webp';
       
-      setChatSession(createOsintChatSession(base64, mimeType, result));
+      setChatSession(
+        createOsintChatSession(base64, mimeType, result, formatC2paContextForChat(c2paResult))
+      );
       setMessages([{ role: 'model', text: 'LOCUS OSINT Agent online. Ready to answer questions regarding this visual analysis.' }]);
     } else {
       setChatSession(null);
       setMessages([]);
     }
-  }, [result, image]);
+  }, [result, image, c2paResult]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -151,10 +172,45 @@ export default function App() {
     }
   };
 
+  const runC2paScan = useCallback(async (selectedFile: File) => {
+    const generation = ++c2paScanGeneration.current;
+    setC2paScanning(true);
+    setC2paResult(null);
+
+    try {
+      const { scanImageForC2pa } = await import('./services/c2paService');
+      const scan = await scanImageForC2pa(selectedFile);
+      if (generation === c2paScanGeneration.current) {
+        setC2paResult(normalizeC2paScanResult(scan));
+      }
+    } catch (err) {
+      console.error("C2PA scan failed:", err);
+      if (generation === c2paScanGeneration.current) {
+        setC2paResult(
+          normalizeC2paScanResult({
+            status: "error",
+            summary: "C2PA scan failed unexpectedly.",
+            errorMessage: err instanceof Error ? err.message : "Unknown error",
+            softwareAgents: [],
+            actions: [],
+            digitalSourceTypes: [],
+            validationIssues: [],
+            scannedAt: Date.now(),
+          })
+        );
+      }
+    } finally {
+      if (generation === c2paScanGeneration.current) {
+        setC2paScanning(false);
+      }
+    }
+  }, []);
+
   const onDrop = useCallback((acceptedFiles: File[]) => {
     const selectedFile = acceptedFiles[0];
     if (selectedFile) {
       setFile(selectedFile);
+      void runC2paScan(selectedFile);
       const reader = new FileReader();
       reader.onload = (e) => {
         setImage(e.target?.result as string);
@@ -164,7 +220,7 @@ export default function App() {
       };
       reader.readAsDataURL(selectedFile);
     }
-  }, []);
+  }, [runC2paScan]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
@@ -186,6 +242,7 @@ export default function App() {
         id: crypto.randomUUID(),
         image,
         result: res,
+        c2pa: c2paResult ?? undefined,
         timestamp: Date.now()
       };
       setHistory(prev => [newItem, ...prev].slice(0, 20)); // Keep last 20
@@ -199,6 +256,8 @@ export default function App() {
   const loadHistoryItem = (item: HistoryItem) => {
     setImage(item.image);
     setResult(item.result);
+    setC2paResult(normalizeC2paScanResult(item.c2pa));
+    setC2paScanning(false);
     setFile(null); // File object can't be restored from localstorage easily
     setError(null);
     setActiveTab('analysis');
@@ -210,9 +269,12 @@ export default function App() {
   };
 
   const reset = () => {
+    c2paScanGeneration.current += 1;
     setImage(null);
     setFile(null);
     setResult(null);
+    setC2paResult(null);
+    setC2paScanning(false);
     setError(null);
     setTempMarker(null);
   };
@@ -372,6 +434,10 @@ export default function App() {
                       </div>
                     )}
                   </section>
+
+                  {(image || c2paScanning || c2paResult) && (
+                    <C2paCredentialsPanel scanning={c2paScanning} result={c2paResult} />
+                  )}
 
                   {/* Coordinates Section */}
                   <section className="space-y-4">
@@ -589,6 +655,7 @@ export default function App() {
                           <div className="min-w-0 flex-1">
                             <h4 className="text-[11px] font-bold text-gray-300 truncate tracking-tight">{item.result.locationName}</h4>
                             <div className="flex items-center gap-2 mt-1">
+                              <C2paHistoryIcon c2pa={item.c2pa} />
                               <span className="text-[9px] text-cyan-600 font-mono">{(item.result.confidence * 100).toFixed(0)}% CONF</span>
                               <span className="text-[9px] text-gray-600 font-mono">{new Date(item.timestamp).toLocaleDateString()}</span>
                             </div>
@@ -663,6 +730,24 @@ export default function App() {
                   </div>
 
                   <div className="hidden lg:block w-[1px] h-6 bg-white/10" />
+
+                  {(image || c2paScanning || c2paResult) && (
+                    <>
+                      <div className="space-y-1">
+                        <span className="text-[9px] text-gray-500 uppercase font-bold tracking-widest block">Content Credentials</span>
+                        <span className={`text-[10px] font-mono uppercase tracking-widest block ${
+                          c2paResult?.status === 'present_valid_ai_claimed' || c2paResult?.status === 'present_unverified'
+                            ? 'text-amber-400'
+                            : c2paResult?.status === 'present_valid'
+                              ? 'text-cyan-400'
+                              : 'text-gray-500'
+                        }`}>
+                          {c2paScanning ? 'C2PA: SCANNING…' : getC2paChipLabel(c2paResult)}
+                        </span>
+                      </div>
+                      <div className="hidden lg:block w-[1px] h-6 bg-white/10" />
+                    </>
+                  )}
 
                   <div className="space-y-1">
                     <span className="text-[9px] text-gray-500 uppercase font-bold tracking-widest block">Analysis Mode</span>
@@ -740,6 +825,7 @@ export default function App() {
             ) : (
               <div className="relative flex flex-col items-center">
                 <div className={`relative group transition-transform ${isAnalyzing ? 'scale-105' : ''}`}>
+                  <C2paImageBadge scanning={c2paScanning} result={c2paResult} />
                   <img 
                     src={image} 
                     alt="Target" 

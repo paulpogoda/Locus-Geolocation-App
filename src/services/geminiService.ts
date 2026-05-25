@@ -141,7 +141,12 @@ export interface ChatSession {
   sendMessage(text: string): Promise<string>;
 }
 
-export function createOsintChatSession(base64Data: string, mimeType: string, result: GeolocationResult): ChatSession {
+export function createOsintChatSession(
+  base64Data: string,
+  mimeType: string,
+  result: GeolocationResult,
+  c2paContext?: string
+): ChatSession {
   const systemInstruction = `You are a specialized OSINT (Open Source Intelligence) assistant called "LOCUS" embedded in an analytical engine. 
 The system engine has already processed an image provided by the user with the following findings:
 - Estimated Location: ${result.locationName}
@@ -149,6 +154,7 @@ The system engine has already processed an image provided by the user with the f
 - Confidence Score: ${(result.confidence * 100).toFixed(1)}%
 - System Heuristic Summary: ${result.description}
 - Identifiable Evidentiary Features: ${result.evidence.join('; ')}
+- Content Credentials (C2PA): ${c2paContext || "Not scanned or unavailable."}
 
 Your task is to answer user questions about this image and the system's conclusions.
 When appropriate, carefully reference specific details like architectural styles, language/text, infrastructure variants (e.g. road lines, poles), and environmental clues (flora, terrain, shadow angles).
