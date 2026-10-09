@@ -2,6 +2,9 @@ import { useState, useCallback, useEffect, MouseEvent, useRef } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { MapContainer, TileLayer, Marker, useMap } from 'react-leaflet';
 import L from 'leaflet';
+import markerIcon from 'leaflet/dist/images/marker-icon.png';
+import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png';
+import markerShadow from 'leaflet/dist/images/marker-shadow.png';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   MapPin, 
@@ -25,30 +28,45 @@ import {
   Send,
   Settings,
   Key,
-  AlertCircle
+  AlertCircle,
+  Copy,
+  Eye,
+  EyeOff
 } from 'lucide-react';
-import { 
-  geolocateImage, 
-  GeolocationResult, 
-  AnalysisMode, 
-  createOsintChatSession, 
-  ChatSession, 
-  getConfig 
-} from './services/geminiService';
+import {
+  getGeoProvider,
+  LocusError,
+  type AnalysisMode,
+  type ChatSession,
+  type GeolocationResult,
+  type GroundingTool,
+} from './services/geo';
+import {
+  clearLocalData,
+  DEFAULT_CONFIG,
+  getConfig,
+  MODEL_OPTIONS,
+  saveConfig,
+  type LocusConfig,
+} from './services/config';
+import { formatDecimalPair, formatLatitude, formatLongitude } from './lib/coords';
+import { SearchEntryPointFrame } from './components/SearchEntryPointFrame';
+import {
+  isHistoryEnabled,
+  loadHistory,
+  MAX_HISTORY,
+  mergeHistory,
+  saveHistory,
+  setHistoryEnabled,
+  type HistoryItem,
+} from './lib/historyStore';
 import Markdown from 'react-markdown';
-
-interface HistoryItem {
-  id: string;
-  image: string;
-  result: GeolocationResult;
-  timestamp: number;
-}
 
 // Fix for Leaflet default marker icon
 const DefaultIcon = L.icon({
-  iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
-  iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
-  shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+  iconUrl: markerIcon,
+  iconRetinaUrl: markerIcon2x,
+  shadowUrl: markerShadow,
   iconSize: [25, 41],
   iconAnchor: [12, 41],
   popupAnchor: [1, -34],
@@ -57,20 +75,42 @@ const DefaultIcon = L.icon({
 
 L.Marker.prototype.options.icon = DefaultIcon;
 
+function mimeTypeOf(dataUrl: string): string {
+  const match = /^data:([^;,]+)[;,]/.exec(dataUrl);
+  return match?.[1] ?? 'image/jpeg';
+}
+
+/** Errors the user can fix by switching to another key or project. */
+function isKeyRelated(err: unknown): boolean {
+  return err instanceof LocusError && (err.code === 'AUTH' || err.code === 'QUOTA' || err.code === 'MODEL_UNAVAILABLE');
+}
+
+/** Last four characters, enough to tell keys apart without exposing them. */
+function keyHint(key: string): string {
+  return key.length > 8 ? `…${key.slice(-4)}` : '';
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof LocusError) {
+    const showDetail = (err.code === 'UNKNOWN' || err.code === 'PARSE') && err.detail;
+    return showDetail ? `${err.message} (${err.detail!.slice(0, 300)})` : err.message;
+  }
+  return err instanceof Error ? err.message : 'Analysis failed. Please try again.';
+}
+
 // Helper to manage map controls (re-center & zoom)
-function MapController({ center }: { center: [number, number] }) {
+function MapController({ center, zoom, target }: { center: [number, number]; zoom: number; target: [number, number] }) {
   const map = useMap();
   
-  // Auto-center when 'center' prop changes (new result)
   useEffect(() => {
-    map.setView(center, 13, { animate: true });
+    map.setView(center, zoom, { animate: true });
     
     // small delay to ensure container is fully sized
     const timer = setTimeout(() => {
       map.invalidateSize();
     }, 200);
     return () => clearTimeout(timer);
-  }, [center, map]);
+  }, [center, zoom, map]);
 
   useEffect(() => {
     const resizeObserver = new ResizeObserver(() => {
@@ -101,7 +141,7 @@ function MapController({ center }: { center: [number, number] }) {
       </button>
       <div className="w-[1px] h-3 bg-white/10 mx-0.5" />
       <button 
-        onClick={() => map.setView(center, 13, { animate: true })}
+        onClick={() => map.setView(target, 13, { animate: true })}
         className="p-1.5 bg-cyan-600 hover:bg-cyan-500 border border-cyan-400/30 rounded shadow-[0_0_10px_rgba(8,145,178,0.3)] transition-all group"
         title="Re-center on Target"
       >
@@ -117,6 +157,7 @@ export default function App() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [result, setResult] = useState<GeolocationResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [errorNeedsKey, setErrorNeedsKey] = useState(false);
   const [mapCenter, setMapCenter] = useState<[number, number]>([0, 0]);
   const [mapZoom, setMapZoom] = useState(13);
   const [tempMarker, setTempMarker] = useState<[number, number] | null>(null);
@@ -128,46 +169,71 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [isChatOpen, setIsChatOpen] = useState(false);
   
-  const [history, setHistory] = useState<HistoryItem[]>(() => {
-    const saved = localStorage.getItem('osint_history');
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [historyEnabled, setHistoryEnabledState] = useState(isHistoryEnabled);
+  const currentImageRef = useRef<string | null>(null);
+  currentImageRef.current = image;
   const [activeTab, setActiveTab] = useState<'analysis' | 'history'>('analysis');
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('visual');
-  const [groundingTool, setGroundingTool] = useState<'search' | 'maps'>('maps');
+  const [groundingTool, setGroundingTool] = useState<GroundingTool>('maps');
 
   // Config Management
-  const [config, setConfig] = useState(() => getConfig());
+  const [config, setConfig] = useState<LocusConfig>(() => getConfig());
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState(config.apiKey);
   const [selectedModel, setSelectedModel] = useState(config.modelName);
+  const [rememberKeyInput, setRememberKeyInput] = useState(config.rememberKey);
+  const [showKey, setShowKey] = useState(false);
 
   const openSettings = () => {
     setApiKeyInput(config.apiKey);
     setSelectedModel(config.modelName);
+    setRememberKeyInput(config.rememberKey);
+    setShowKey(false);
     setIsSettingsOpen(true);
   };
 
   useEffect(() => {
-    localStorage.setItem('osint_history', JSON.stringify(history));
-  }, [history]);
+    let cancelled = false;
+    loadHistory().then((stored) => {
+      if (cancelled) return;
+      // Analyses finished before the store answered are kept.
+      setHistory((prev) => mergeHistory(prev, stored));
+      setHistoryLoaded(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    // Writing before the initial load would overwrite the stored history.
+    if (historyLoaded) void saveHistory(history);
+  }, [history, historyLoaded]);
+
+  const toggleHistoryEnabled = (enabled: boolean) => {
+    setHistoryEnabled(enabled);
+    setHistoryEnabledState(enabled);
+  };
+
+  useEffect(() => {
+    if (result?.coordinates) {
+      setMapCenter([result.coordinates.lat, result.coordinates.lng]);
+      setMapZoom(13);
+      setTempMarker(null);
+    }
+  }, [result]);
 
   useEffect(() => {
     if (result && image && config.apiKey) {
-      setMapCenter([result.coordinates.lat, result.coordinates.lng]);
-      setMapZoom(13);
-      
-      const base64 = image.split(',')[1];
-      let mimeType = 'image/jpeg';
-      if (image.startsWith('data:image/png')) mimeType = 'image/png';
-      else if (image.startsWith('data:image/webp')) mimeType = 'image/webp';
-      
       try {
-        setChatSession(createOsintChatSession(base64, mimeType, result));
-        setMessages([{ role: 'model', text: 'LOCUS OSINT Agent online. Ready to answer questions regarding this visual analysis.' }]);
-      } catch (e: any) {
-        console.error("Chat session creation failed:", e);
-        setError(e.message || "Uplink creation failed.");
+        setChatSession(getGeoProvider().createChatSession({ base64Data: image.split(',')[1], mimeType: mimeTypeOf(image) }, result));
+        setMessages([{ role: 'model', text: 'Ask about the image or the analysis. Answers are model output and need independent verification.' }]);
+      } catch (e) {
+        console.error('Chat session creation failed:', e);
+        setError(errorMessage(e));
+        setErrorNeedsKey(isKeyRelated(e));
       }
     } else {
       setChatSession(null);
@@ -192,8 +258,7 @@ export default function App() {
       const resp = await chatSession.sendMessage(userText);
       setMessages(prev => [...prev, { role: 'model', text: resp }]);
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : 'SYS_ERR: Unable to process query.';
-      setMessages(prev => [...prev, { role: 'model', text: errMsg }]);
+      setMessages(prev => [...prev, { role: 'model', text: `Error: ${errorMessage(err)}` }]);
     } finally {
       setIsChatting(false);
     }
@@ -225,24 +290,35 @@ export default function App() {
       openSettings();
       return;
     }
-    if (!image || !file) return;
+    if (!image) return;
+    const requestImage = image;
     setIsAnalyzing(true);
     setError(null);
     try {
-      const base64Data = image.split(',')[1];
-      const res = await geolocateImage(base64Data, file.type, analysisMode, groundingTool);
+      const res = await getGeoProvider().analyzeImage({
+        base64Data: image.split(',')[1],
+        mimeType: file?.type || mimeTypeOf(image),
+        mode: analysisMode,
+        groundingTool,
+      });
+      // The user may have replaced or cleared the image while the request was running.
+      if (currentImageRef.current !== requestImage) return;
       setResult(res);
 
-      // Add to history
-      const newItem: HistoryItem = {
-        id: crypto.randomUUID(),
-        image,
-        result: res,
-        timestamp: Date.now()
-      };
-      setHistory(prev => [newItem, ...prev].slice(0, 20)); // Keep last 20
+      if (historyEnabled) {
+        const newItem: HistoryItem = {
+          id: crypto.randomUUID(),
+          image: requestImage,
+          result: res,
+          timestamp: Date.now()
+        };
+        setHistory(prev => [newItem, ...prev].slice(0, MAX_HISTORY));
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Analysis failed. Please try again.");
+      if (currentImageRef.current === requestImage) {
+        setError(errorMessage(err));
+        setErrorNeedsKey(isKeyRelated(err));
+      }
     } finally {
       setIsAnalyzing(false);
     }
@@ -251,7 +327,7 @@ export default function App() {
   const loadHistoryItem = (item: HistoryItem) => {
     setImage(item.image);
     setResult(item.result);
-    setFile(null); // File object can't be restored from localstorage easily
+    setFile(null);
     setError(null);
     setActiveTab('analysis');
   };
@@ -288,7 +364,7 @@ export default function App() {
   };
 
   const handleSourceClick = (source: { uri: string; type: string }, e: React.MouseEvent) => {
-    if (source.type === 'maps' && result) {
+    if (source.type === 'maps' && result?.coordinates) {
       const url = source.uri;
       const coordMatch = url.match(/query=([-+]?\d*\.?\d+),([-+]?\d*\.?\d+)/) || 
                        url.match(/@([-+]?\d*\.?\d+),([-+]?\d*\.?\d+)(?:,(\d+)z)?/) ||
@@ -315,7 +391,7 @@ export default function App() {
   };
 
   const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
+    navigator.clipboard.writeText(text).catch((e) => console.error('Clipboard write failed', e));
   };
 
   return (
@@ -328,7 +404,7 @@ export default function App() {
           </h1>
           <a href="https://provereno.media/" target="_blank" rel="noopener noreferrer" className="hover:opacity-80 transition-opacity">
             <img 
-              src="/Provereno Logo.png" 
+              src={`${import.meta.env.BASE_URL}Provereno Logo.png`} 
               alt="Provereno Logo" 
               className="h-6 md:h-7 object-contain rounded-sm" 
             />
@@ -342,7 +418,7 @@ export default function App() {
                 className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-amber-500/10 border border-amber-500/30 text-[9px] font-mono font-bold text-amber-500 animate-pulse uppercase tracking-wider hover:bg-amber-500/20 transition-all"
               >
                 <AlertCircle className="w-3 h-3" />
-                <span>UPLINK: OFFLINE (NO KEY)</span>
+                <span>NO API KEY</span>
               </button>
             ) : (
               <button 
@@ -350,7 +426,7 @@ export default function App() {
                 className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-cyan-950/40 border border-cyan-500/30 text-[9px] font-mono font-bold text-cyan-400 uppercase tracking-wider hover:bg-cyan-500/10 transition-all"
               >
                 <Key className="w-3 h-3 text-cyan-400" />
-                <span>UPLINK: SECURED</span>
+                <span>KEY {keyHint(config.apiKey) || 'SET'} · CHANGE</span>
               </button>
             )}
           </div>
@@ -361,7 +437,7 @@ export default function App() {
             <History className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500" />
             <div className="w-80 bg-white/5 border border-white/10 rounded-full py-1.5 px-9 text-[10px] text-gray-500 font-mono flex items-center gap-2">
               <span className="text-cyan-500 animate-pulse">●</span>
-              ARCHIVE_READY: {history.length} OBJECTS STORED
+              LOCAL HISTORY: {history.length} SAVED IN THIS BROWSER{!historyEnabled && ' · SAVING OFF'}
             </div>
           </div>
 
@@ -403,7 +479,7 @@ export default function App() {
           <div className="flex items-center gap-2">
             <div className={`w-1.5 h-1.5 rounded-full animate-pulse ${config.apiKey ? 'bg-cyan-500' : 'bg-amber-500'}`}></div>
             <span className={`${config.apiKey ? 'text-cyan-400' : 'text-amber-500'} uppercase tracking-widest`}>
-              {config.apiKey ? 'Uplink: Live' : 'Uplink: Offline'}
+              {config.apiKey ? 'Key: set' : 'Key: missing'}
             </span>
           </div>
           <div className="w-8 h-8 rounded-full bg-gray-900 border border-white/10 flex items-center justify-center overflow-hidden">
@@ -446,12 +522,12 @@ export default function App() {
                 >
                   {/* Probability / Confidence */}
                   <section>
-                    <label className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-3 block">Probability Score</label>
+                    <label className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-3 block">Model-Reported Confidence</label>
                     {result ? (
                       <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
                         <div className="flex items-end gap-2">
-                          <span className="text-5xl font-light text-cyan-400">{(result.confidence * 100).toFixed(1)}<span className="text-2xl">%</span></span>
-                          <span className="text-xs text-green-500 mb-2 font-mono uppercase">Validated</span>
+                          <span className="text-5xl font-light text-cyan-400">{(result.confidence * 100).toFixed(0)}<span className="text-2xl">%</span></span>
+                          <span className="text-xs text-amber-500 mb-2 font-mono uppercase">{result.coordinates ? 'Hypothesis · verify manually' : 'Location not determined'}</span>
                         </div>
                         <div className="mt-3 h-1 w-full bg-white/5 rounded-full overflow-hidden">
                           <motion.div 
@@ -476,29 +552,29 @@ export default function App() {
                       <div className="flex justify-between items-center">
                         <span className="text-[10px] text-gray-500 font-mono uppercase">Latitude</span>
                         <span className="font-mono text-sm text-cyan-400">
-                          {result ? `${result.coordinates.lat.toFixed(4)}° N` : '---.----'}
+                          {result?.coordinates ? formatLatitude(result.coordinates.lat) : result ? 'Not determined' : '---.----'}
                         </span>
                       </div>
                       <div className="flex justify-between items-center">
                         <span className="text-[10px] text-gray-500 font-mono uppercase">Longitude</span>
                         <span className="font-mono text-sm text-cyan-400">
-                          {result ? `${result.coordinates.lng.toFixed(4)}° E` : '---.----'}
+                          {result?.coordinates ? formatLongitude(result.coordinates.lng) : result ? 'Not determined' : '---.----'}
                         </span>
                       </div>
-                      {result && (
+                      {result?.coordinates && (
                         <div className="flex gap-2 mt-2">
                           <button 
-                            onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${result.coordinates.lat},${result.coordinates.lng}`, '_blank')}
+                            onClick={() => result.coordinates && window.open(`https://www.google.com/maps/search/?api=1&query=${result.coordinates.lat},${result.coordinates.lng}`, '_blank', 'noopener,noreferrer')}
                             className="flex-1 py-2 bg-white/5 border border-white/10 rounded text-[10px] text-gray-400 hover:bg-white/10 hover:text-white transition-all uppercase tracking-widest"
                           >
                             Earth View
                           </button>
                           <button 
-                            onClick={() => copyToClipboard(`${result.coordinates.lat}, ${result.coordinates.lng}`)}
+                            onClick={() => result.coordinates && copyToClipboard(formatDecimalPair(result.coordinates))}
                             className="px-3 py-2 bg-white/5 border border-white/10 rounded text-[10px] text-gray-400 hover:bg-white/10 hover:text-white transition-all uppercase tracking-widest flex items-center justify-center"
                             title="Copy Coordinates"
                           >
-                            <Upload className="w-3 h-3 rotate-180" />
+                            <Copy className="w-3 h-3" />
                           </button>
                         </div>
                       )}
@@ -523,14 +599,26 @@ export default function App() {
                     </div>
                   </section>
 
-                  {/* Components / Search Queries */}
-                  {result?.searchQueriesExecuted && result.searchQueriesExecuted.length > 0 && (
+                  {/* Search queries: executed (from grounding metadata) vs. claimed by the model */}
+                  {result && result.groundingQueries.length > 0 && (
                     <section className="space-y-3">
-                      <label className="text-[10px] uppercase tracking-widest text-gray-500 font-bold block">Queries Executed</label>
+                      <label className="text-[10px] uppercase tracking-widest text-gray-500 font-bold block">Queries Executed by Google</label>
                       <div className="flex flex-wrap gap-2">
-                        {result.searchQueriesExecuted.map((q, i) => (
+                        {result.groundingQueries.map((q, i) => (
                           <div key={i} className="px-2 py-1 bg-white/5 border border-white/10 rounded text-[10px] text-gray-300 font-mono flex items-center gap-1.5">
                             <Search className="w-3 h-3 text-cyan-500" />
+                            {q}
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  )}
+                  {result && result.modelReportedQueries.length > 0 && (
+                    <section className="space-y-3">
+                      <label className="text-[10px] uppercase tracking-widest text-gray-500 font-bold block">Queries Reported by Model (unverified)</label>
+                      <div className="flex flex-wrap gap-2">
+                        {result.modelReportedQueries.map((q, i) => (
+                          <div key={i} className="px-2 py-1 bg-white/5 border border-white/10 rounded text-[10px] text-gray-500 font-mono">
                             {q}
                           </div>
                         ))}
@@ -569,11 +657,10 @@ export default function App() {
                   {/* Grounding Widget */}
                   {result?.searchEntryPointHtml && (
                     <section className="space-y-3">
-                      <label className="text-[10px] uppercase tracking-widest text-gray-500 font-bold block">Enhanced Grounding</label>
-                      <div 
-                        className="bg-white/5 border border-white/10 rounded-lg p-2 min-h-[40px] overflow-hidden [&_a]:text-cyan-400 [&_a]:hover:underline"
-                        dangerouslySetInnerHTML={{ __html: result.searchEntryPointHtml }}
-                      />
+                      <label className="text-[10px] uppercase tracking-widest text-gray-500 font-bold block">Google Search Suggestions</label>
+                      <div className="bg-white/5 border border-white/10 rounded-lg p-2 overflow-hidden">
+                        <SearchEntryPointFrame html={result.searchEntryPointHtml} />
+                      </div>
                     </section>
                   )}
 
@@ -595,7 +682,7 @@ export default function App() {
                             </div>
                             <div>
                               <p className="text-xs font-semibold text-gray-200">{item}</p>
-                              <p className="text-[10px] text-gray-600 font-mono uppercase tracking-tighter">Feature Confirmed</p>
+                              <p className="text-[10px] text-gray-600 font-mono uppercase tracking-tighter">Reported by model</p>
                             </div>
                           </motion.div>
                         ))
@@ -653,7 +740,7 @@ export default function App() {
                   className="p-4 space-y-4"
                 >
                   <div className="flex items-center justify-between px-2">
-                    <label className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Encrypted Archive</label>
+                    <label className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Local History (not encrypted)</label>
                     {history.length > 0 && (
                       <button 
                         onClick={() => { if(confirm('Purge all archived records?')) setHistory([]) }}
@@ -662,6 +749,18 @@ export default function App() {
                         <Trash2 className="w-3 h-3" /> Purge
                       </button>
                     )}
+                  </div>
+                  <div className="px-2 space-y-2 text-[10px] font-mono text-gray-500 leading-relaxed">
+                    <p>Analyses and images are stored only in this browser (IndexedDB), without encryption. Anyone with access to this browser profile can open them.</p>
+                    <label className="flex items-center gap-2 text-gray-400 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={historyEnabled}
+                        onChange={e => toggleHistoryEnabled(e.target.checked)}
+                        className="accent-cyan-500"
+                      />
+                      Save new analyses to history
+                    </label>
                   </div>
                   
                   {history.length === 0 ? (
@@ -683,7 +782,7 @@ export default function App() {
                           <div className="min-w-0 flex-1">
                             <h4 className="text-[11px] font-bold text-gray-300 truncate tracking-tight">{item.result.locationName}</h4>
                             <div className="flex items-center gap-2 mt-1">
-                              <span className="text-[9px] text-cyan-600 font-mono">{(item.result.confidence * 100).toFixed(0)}% CONF</span>
+                              <span className="text-[9px] text-cyan-600 font-mono">{item.result.coordinates ? `${(item.result.confidence * 100).toFixed(0)}% (model)` : 'NOT DETERMINED'}</span>
                               <span className="text-[9px] text-gray-600 font-mono">{new Date(item.timestamp).toLocaleDateString()}</span>
                             </div>
                           </div>
@@ -704,9 +803,9 @@ export default function App() {
 
           <div className="mt-auto p-4 border-t border-white/5 bg-black/20">
             <div className="text-[10px] text-gray-600 font-mono uppercase leading-relaxed">
-              SESSION_TOKEN: 0x921A_F2<br/>
-              DECODING: {isAnalyzing ? 'ACTIVE' : 'STANDBY'}<br/>
-              BUFFER: 100%
+              MODEL: {result?.model ?? config.modelName}<br/>
+              STATUS: {isAnalyzing ? 'ANALYZING' : 'IDLE'}
+              {result?.modelFallbackFrom && (<><br/><span className="text-amber-600">{result.modelFallbackFrom} unavailable, used {result.model}</span></>)}
             </div>
           </div>
         </aside>
@@ -718,7 +817,7 @@ export default function App() {
             <div className="bg-black/60 backdrop-blur-xl border border-white/10 rounded-xl flex flex-col md:flex-row items-stretch overflow-hidden">
                {/* Map Preview */}
                <div className="w-40 h-40 shrink-0 bg-gray-950 border-r border-white/10 relative overflow-hidden group">
-                  {result ? (
+                  {result?.coordinates ? (
                     <MapContainer 
                       center={mapCenter} 
                       zoom={mapZoom} 
@@ -735,15 +834,19 @@ export default function App() {
                       />
                       <Marker position={[result.coordinates.lat, result.coordinates.lng]} />
                       {tempMarker && <Marker position={tempMarker} opacity={0.5} />}
-                      <MapController center={mapCenter} />
+                      <MapController center={mapCenter} zoom={mapZoom} target={[result.coordinates.lat, result.coordinates.lng]} />
                     </MapContainer>
                   ) : (
                     <div className="w-full h-full flex flex-col items-center justify-center opacity-10 bg-[radial-gradient(#ffffff10_1px,transparent_1px)] bg-[size:16px_16px]">
                       <Compass className="w-10 h-10" />
                     </div>
                   )}
-                  <div className="absolute bottom-2 left-2 px-2 py-1 bg-black/80 rounded border border-white/10 text-[7px] font-mono text-cyan-400 uppercase tracking-[0.2em] pointer-events-none">
-                    Map_Link: Active
+                  <div className="absolute bottom-1 left-1 px-1.5 py-0.5 bg-black/80 rounded text-[7px] font-mono text-gray-400 z-[1000]">
+                    {analysisMode === 'satellite' ? (
+                      <a href="https://www.esri.com/" target="_blank" rel="noopener noreferrer">Tiles © Esri</a>
+                    ) : (
+                      <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap</a>
+                    )}
                   </div>
                </div>
 
@@ -901,6 +1004,15 @@ export default function App() {
                     className="mt-6 px-4 py-2 bg-red-950/40 border border-red-500/40 rounded text-xs text-red-400 font-mono max-w-lg"
                   >
                     SYS_ERR: {error}
+                    {errorNeedsKey && (
+                      <button
+                        type="button"
+                        onClick={openSettings}
+                        className="mt-2 flex items-center gap-1.5 text-cyan-400 hover:text-cyan-300 hover:underline"
+                      >
+                        <Key className="w-3 h-3" /> Change API key{config.apiKey && ` (current ${keyHint(config.apiKey)})`}
+                      </button>
+                    )}
                   </motion.div>
                 )}
               </div>
@@ -920,10 +1032,10 @@ export default function App() {
                  </div>
                  <div className="flex flex-col">
                    <span className="text-[10px] font-mono font-bold text-cyan-400 uppercase tracking-widest leading-none mb-1">
-                     LOCUS Uplink _
+                     LOCUS Chat
                    </span>
                    <span className="text-[8px] font-mono text-cyan-600 uppercase tracking-widest leading-none">
-                     Secure Channel Engaged
+                     Direct to Gemini API with your key
                    </span>
                  </div>
                </div>
@@ -979,7 +1091,7 @@ export default function App() {
                   </div>
                   <div className="bg-cyan-950/5 border border-cyan-900/30 border-l-2 border-l-cyan-600 rounded-sm p-3.5 flex items-center gap-3">
                     <Loader2 className="w-4 h-4 text-cyan-500 hover:text-cyan-400 animate-spin" />
-                    <span className="text-xs font-mono text-cyan-600 animate-pulse">Processing query via uplink</span>
+                    <span className="text-xs font-mono text-cyan-600 animate-pulse">Waiting for Gemini…</span>
                   </div>
                 </div>
               )}
@@ -1024,7 +1136,7 @@ export default function App() {
                  </button>
               </form>
               <div className="mt-2 text-[8px] font-mono text-gray-600 text-center uppercase tracking-widest">
-                 System: {config.modelName} / BYOK UPLINK Active
+                 Model: {result.model} · answers need independent verification
               </div>
             </div>
           </aside>
@@ -1045,7 +1157,7 @@ export default function App() {
               initial={{ scale: 0.95, y: 10 }}
               animate={{ scale: 1, y: 0 }}
               exit={{ scale: 0.95, y: 10 }}
-              className="w-full max-w-md bg-[#0a0a0a] border border-cyan-500/30 rounded-xl overflow-hidden shadow-[0_0_50px_rgba(8,145,178,0.25)] flex flex-col"
+              className="w-full max-w-md max-h-[calc(100dvh-2rem)] bg-[#0a0a0a] border border-cyan-500/30 rounded-xl overflow-hidden shadow-[0_0_50px_rgba(8,145,178,0.25)] flex flex-col"
               onClick={e => e.stopPropagation()}
             >
               {/* Header */}
@@ -1063,14 +1175,23 @@ export default function App() {
               </div>
 
               {/* Body */}
-              <div className="p-6 space-y-6">
+              <div className="p-6 space-y-6 overflow-y-auto min-h-0">
                 <div className="p-3.5 bg-cyan-950/20 border border-cyan-500/20 rounded-lg space-y-2 text-xs leading-relaxed text-gray-400 font-mono">
                   <div className="flex items-center gap-2 text-cyan-400 font-bold">
                     <Info className="w-4 h-4 shrink-0" />
-                    <span>DIRECT API CONNECTION (BYOK)</span>
+                    <span>YOUR OWN GEMINI KEY (BYOK)</span>
                   </div>
                   <p>
-                    LOCUS runs entirely client-side. Your Google Gemini API Key is stored securely in your browser's local storage and is sent directly to Google's API servers.
+                    LOCUS runs in your browser. Images and your key go directly to Google's Gemini API; Provereno servers never receive them.
+                  </p>
+                  <p>
+                    The key is stored in this browser without encryption: in local storage if "Remember key" is on, otherwise only in this tab until it is closed. Anyone with access to this browser profile can read it.
+                  </p>
+                  <p>
+                    Restrict the key in Google Cloud Console → Credentials: under API restrictions allow only the Generative Language API; under Application restrictions choose Websites and add the LOCUS domain.
+                  </p>
+                  <p className="text-amber-500/90">
+                    On Google's free tier, submitted images may be used to improve Google products and may be seen by human reviewers. Do not upload sensitive or unpublished material with a free-tier key.
                   </p>
                   <a 
                     href="https://aistudio.google.com/app/apikey" 
@@ -1078,7 +1199,7 @@ export default function App() {
                     rel="noopener noreferrer"
                     className="inline-flex items-center gap-1.5 text-cyan-400 hover:text-cyan-300 hover:underline pt-1 font-bold"
                   >
-                    Get your free API key at Google AI Studio <ExternalLink className="w-3.5 h-3.5" />
+                    Get an API key in Google AI Studio <ExternalLink className="w-3.5 h-3.5" />
                   </a>
                 </div>
 
@@ -1091,13 +1212,52 @@ export default function App() {
                     <div className="relative flex items-center">
                       <Key className="absolute left-3 w-4 h-4 text-cyan-600 pointer-events-none" />
                       <input 
-                        type="password"
+                        type={showKey ? 'text' : 'password'}
                         value={apiKeyInput}
                         onChange={e => setApiKeyInput(e.target.value)}
                         placeholder="AIzaSy..."
-                        className="w-full bg-[#111] border border-white/10 focus:border-cyan-500/50 rounded pl-10 pr-4 py-2.5 text-xs font-mono text-white placeholder-gray-700 focus:outline-none transition-all"
+                        autoComplete="off"
+                        spellCheck={false}
+                        className="w-full bg-[#111] border border-white/10 focus:border-cyan-500/50 rounded pl-10 pr-16 py-2.5 text-xs font-mono text-white placeholder-gray-700 focus:outline-none transition-all"
                       />
+                      <div className="absolute right-2 flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => setShowKey(v => !v)}
+                          className="p-1 text-gray-500 hover:text-cyan-400"
+                          title={showKey ? 'Hide key' : 'Show key'}
+                        >
+                          {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                        </button>
+                        {apiKeyInput && (
+                          <button
+                            type="button"
+                            onClick={() => setApiKeyInput('')}
+                            className="p-1 text-gray-500 hover:text-red-400"
+                            title="Clear field to paste another key"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
                     </div>
+                    {config.apiKey && (
+                      <p className="text-[10px] font-mono text-gray-600">
+                        Active key: {keyHint(config.apiKey) || 'set'}. To switch keys, clear the field, paste the new key and save.
+                      </p>
+                    )}
+                    <label className="flex items-start gap-2 pt-1 text-[11px] font-mono text-gray-400 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={rememberKeyInput}
+                        onChange={e => setRememberKeyInput(e.target.checked)}
+                        className="mt-0.5 accent-cyan-500"
+                      />
+                      <span>
+                        Remember key on this device
+                        <span className="block text-gray-600">Off: you re-enter the key in each new tab; it is erased when the tab is closed.</span>
+                      </span>
+                    </label>
                   </div>
 
                   <div className="space-y-2">
@@ -1109,8 +1269,9 @@ export default function App() {
                       onChange={e => setSelectedModel(e.target.value)}
                       className="w-full bg-[#111] border border-white/10 focus:border-cyan-500/50 rounded px-3 py-2.5 text-xs font-mono text-gray-300 focus:outline-none transition-all"
                     >
-                      <option value="gemini-3.5-flash">Gemini 3.5 Flash (Recommended: Fast, multimodal, search/maps grounding)</option>
-                      <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro (Deep reasoning, slower)</option>
+                      {MODEL_OPTIONS.map((m) => (
+                        <option key={m.id} value={m.id}>{m.label}</option>
+                      ))}
                     </select>
                   </div>
                 </div>
@@ -1121,13 +1282,13 @@ export default function App() {
                 <button 
                   type="button"
                   onClick={() => {
-                    if (confirm("Are you sure you want to purge all configuration data and analysis history from this device?")) {
-                      localStorage.removeItem('locus_config');
-                      localStorage.removeItem('osint_history');
-                      setConfig({ apiKey: '', modelName: 'gemini-3.5-flash' });
+                    if (confirm("Delete the saved API key, settings and analysis history from this browser?")) {
+                      clearLocalData();
+                      setConfig(DEFAULT_CONFIG);
                       setHistory([]);
                       setApiKeyInput('');
-                      setSelectedModel('gemini-3.5-flash');
+                      setSelectedModel(DEFAULT_CONFIG.modelName);
+                      setRememberKeyInput(DEFAULT_CONFIG.rememberKey);
                       setIsSettingsOpen(false);
                     }
                   }}
@@ -1147,8 +1308,15 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       const trimmedKey = apiKeyInput.trim();
-                      const savedConfig = { apiKey: trimmedKey, modelName: selectedModel };
-                      localStorage.setItem('locus_config', JSON.stringify(savedConfig));
+                      const savedConfig = { apiKey: trimmedKey, modelName: selectedModel, rememberKey: rememberKeyInput };
+                      if (!saveConfig(savedConfig)) {
+                        alert('Could not save settings: browser storage is unavailable.');
+                        return;
+                      }
+                      if (savedConfig.apiKey !== config.apiKey) {
+                        setError(null);
+                        setErrorNeedsKey(false);
+                      }
                       setConfig(savedConfig);
                       setIsSettingsOpen(false);
                     }}
@@ -1166,9 +1334,7 @@ export default function App() {
       {/* Footer Status Bar */}
       <footer className="h-10 bg-[#0f0f0f] border-t border-white/10 px-6 flex items-center justify-between shrink-0">
         <div className="flex gap-6 text-[10px] font-mono text-gray-600 uppercase tracking-tight">
-          <span>VERSION = 0.3</span>
-          <span>Latency: <span className="text-gray-400">12ms</span></span>
-          <span className="text-cyan-800">Cores: 16_ACTIVE</span>
+          <span>VERSION 0.4</span>
         </div>
         <div className="text-[10px] text-gray-600 font-mono uppercase tracking-[0.2em] hidden sm:block">
           Vibecoded by Pavel "Pogoda" Bannikov for Provereno.Media
