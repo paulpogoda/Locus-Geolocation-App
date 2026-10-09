@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
     "test": "vitest run",
     "clean": "rm -rf dist"
   },
