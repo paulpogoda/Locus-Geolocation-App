@@ -45,6 +45,8 @@ import {
   clearLocalData,
   DEFAULT_CONFIG,
   getConfig,
+  hasValidKeyChars,
+  normalizeApiKey,
   MODEL_OPTIONS,
   saveConfig,
   type LocusConfig,
@@ -82,7 +84,10 @@ function mimeTypeOf(dataUrl: string): string {
 
 /** Errors the user can fix by switching to another key or project. */
 function isKeyRelated(err: unknown): boolean {
-  return err instanceof LocusError && (err.code === 'AUTH' || err.code === 'QUOTA' || err.code === 'MODEL_UNAVAILABLE');
+  return (
+    err instanceof LocusError &&
+    (err.code === 'AUTH' || err.code === 'BAD_KEY' || err.code === 'QUOTA' || err.code === 'GROUNDING_QUOTA' || err.code === 'MODEL_UNAVAILABLE')
+  );
 }
 
 /** Last four characters, enough to tell keys apart without exposing them. */
@@ -92,7 +97,7 @@ function keyHint(key: string): string {
 
 function errorMessage(err: unknown): string {
   if (err instanceof LocusError) {
-    const showDetail = (err.code === 'UNKNOWN' || err.code === 'PARSE') && err.detail;
+    const showDetail = (err.code === 'UNKNOWN' || err.code === 'PARSE' || err.code === 'NETWORK') && err.detail;
     return showDetail ? `${err.message} (${err.detail!.slice(0, 300)})` : err.message;
   }
   return err instanceof Error ? err.message : 'Analysis failed. Please try again.';
@@ -185,12 +190,14 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState(config.modelName);
   const [rememberKeyInput, setRememberKeyInput] = useState(config.rememberKey);
   const [showKey, setShowKey] = useState(false);
+  const [keyInputError, setKeyInputError] = useState<string | null>(null);
 
   const openSettings = () => {
     setApiKeyInput(config.apiKey);
     setSelectedModel(config.modelName);
     setRememberKeyInput(config.rememberKey);
     setShowKey(false);
+    setKeyInputError(null);
     setIsSettingsOpen(true);
   };
 
@@ -273,16 +280,23 @@ export default function App() {
         setImage(e.target?.result as string);
         setResult(null);
         setError(null);
+        setErrorNeedsKey(false);
+        setTempMarker(null);
+        setIsChatOpen(false);
         setActiveTab('analysis');
       };
       reader.readAsDataURL(selectedFile);
     }
   }, []);
 
-  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+  // Clicks open the picker only from the empty state or the New Photo buttons; drops work over the whole view.
+  const { getRootProps, getInputProps, isDragActive, open: openFilePicker } = useDropzone({
     onDrop,
     accept: { 'image/*': ['.jpeg', '.jpg', '.png', '.webp'] },
-    multiple: false
+    multiple: false,
+    noClick: true,
+    noKeyboard: true,
+    disabled: !config.apiKey || isAnalyzing,
   } as any);
 
   const handleAnalyze = async () => {
@@ -342,7 +356,9 @@ export default function App() {
     setFile(null);
     setResult(null);
     setError(null);
+    setErrorNeedsKey(false);
     setTempMarker(null);
+    setIsChatOpen(false);
   };
 
   const getDistanceFromLatLonInKm = (lat1: number, lon1: number, lat2: number, lon2: number) => {
@@ -395,10 +411,10 @@ export default function App() {
   };
 
   return (
-    <div className="h-screen bg-[#0a0a0a] text-gray-200 font-sans flex flex-col overflow-hidden selection:bg-cyan-900/40">
+    <div className="min-h-screen md:h-screen bg-[#0a0a0a] text-gray-200 font-sans flex flex-col md:overflow-hidden selection:bg-cyan-900/40">
       {/* Header Bar */}
-      <header className="h-16 border-b border-white/10 flex items-center justify-between px-6 bg-[#0f0f0f] shrink-0">
-        <div className="flex items-center gap-3">
+      <header className="h-16 border-b border-white/10 flex items-center justify-between gap-2 px-3 md:px-6 bg-[#0f0f0f] shrink-0">
+        <div className="flex items-center gap-2 md:gap-3 min-w-0">
           <h1 className="text-lg font-semibold tracking-tight text-white uppercase flex items-baseline gap-2">
             LOCUS <span className="text-xs font-medium text-gray-500 uppercase tracking-widest">by</span>
           </h1>
@@ -406,7 +422,7 @@ export default function App() {
             <img 
               src={`${import.meta.env.BASE_URL}Provereno Logo.png`} 
               alt="Provereno Logo" 
-              className="h-6 md:h-7 object-contain rounded-sm" 
+              className="h-5 md:h-7 shrink-0 object-contain rounded-sm" 
             />
           </a>
 
@@ -432,8 +448,8 @@ export default function App() {
           </div>
         </div>
         
-        <div className="flex items-center gap-4">
-          <div className="relative hidden md:block">
+        <div className="flex items-center gap-2 md:gap-4 shrink-0">
+          <div className="relative hidden xl:block">
             <History className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500" />
             <div className="w-80 bg-white/5 border border-white/10 rounded-full py-1.5 px-9 text-[10px] text-gray-500 font-mono flex items-center gap-2">
               <span className="text-cyan-500 animate-pulse">●</span>
@@ -454,17 +470,30 @@ export default function App() {
           {!config.apiKey ? (
             <button 
               onClick={openSettings}
-              className="px-5 py-1.5 rounded-full text-xs font-semibold uppercase tracking-wider transition-all border border-amber-500/50 text-amber-500 hover:bg-amber-500/10 flex items-center gap-1.5 shadow-[0_0_15px_rgba(245,158,11,0.1)] hover:shadow-[0_0_20px_rgba(245,158,11,0.2)] animate-pulse"
+              className="px-3 md:px-5 py-1.5 rounded-full text-xs font-semibold uppercase tracking-wider whitespace-nowrap transition-all border border-amber-500/50 text-amber-500 hover:bg-amber-500/10 flex items-center gap-1.5 shadow-[0_0_15px_rgba(245,158,11,0.1)] hover:shadow-[0_0_20px_rgba(245,158,11,0.2)] animate-pulse"
             >
               <Key className="w-3.5 h-3.5" />
-              Configure API Key
+              <span className="hidden sm:inline">Configure</span> API Key
             </button>
           ) : (
+            <>
+            {image && (
+              <button
+                onClick={openFilePicker}
+                disabled={isAnalyzing}
+                title="Load another image for a new analysis"
+                aria-label="New Photo"
+                className={`px-2.5 md:px-4 py-1.5 rounded-full text-sm font-medium whitespace-nowrap transition-all flex items-center gap-1.5 border ${isAnalyzing ? 'bg-white/5 text-gray-600 border-white/10 cursor-not-allowed' : 'border-cyan-500/40 text-cyan-400 hover:bg-cyan-500/10'}`}
+              >
+                <Upload className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">New Photo</span>
+              </button>
+            )}
             <button 
               disabled={!image || isAnalyzing || !!result}
               onClick={handleAnalyze}
               className={`
-                px-6 py-1.5 rounded-full text-sm font-medium transition-all
+                px-4 md:px-6 py-1.5 rounded-full text-xs md:text-sm font-medium whitespace-nowrap transition-all
                 ${image && !result && !isAnalyzing 
                   ? 'bg-cyan-600 hover:bg-cyan-500 text-white shadow-[0_0_15px_rgba(8,145,178,0.3)]' 
                   : 'bg-white/5 text-gray-500 border border-white/10 cursor-not-allowed'}
@@ -472,6 +501,7 @@ export default function App() {
             >
               {isAnalyzing ? 'Analyzing Frame...' : 'Identify Frame'}
             </button>
+            </>
           )}
         </div>
 
@@ -488,9 +518,9 @@ export default function App() {
         </div>
       </header>
 
-      <main className="flex-1 flex overflow-hidden">
+      <main className="flex-1 flex flex-col md:flex-row md:overflow-hidden">
         {/* Sidebar: Status & Results */}
-        <aside className="w-80 border-r border-white/10 bg-[#0f0f0f] flex flex-col shrink-0 overflow-hidden">
+        <aside className="order-2 md:order-none w-full md:w-80 border-t md:border-t-0 md:border-r border-white/10 bg-[#0f0f0f] flex flex-col shrink-0 md:overflow-hidden">
           {/* Tab Switcher */}
           <div className="flex border-b border-white/10 bg-black/40">
             <button 
@@ -811,12 +841,12 @@ export default function App() {
         </aside>
 
         {/* Main View Port */}
-        <section className="flex-1 relative bg-[#050505] flex flex-col overflow-hidden">
+        <section className="flex-1 relative bg-[#050505] flex flex-col md:overflow-hidden">
           {/* Map & Context Overlay Bar */}
-          <div className="p-4 shrink-0 z-20">
+          <div className="p-3 md:p-4 shrink-0 z-20">
             <div className="bg-black/60 backdrop-blur-xl border border-white/10 rounded-xl flex flex-col md:flex-row items-stretch overflow-hidden">
                {/* Map Preview */}
-               <div className="w-40 h-40 shrink-0 bg-gray-950 border-r border-white/10 relative overflow-hidden group">
+               <div className={`${result?.coordinates ? 'h-40' : 'hidden md:block md:h-40'} w-full md:w-40 shrink-0 bg-gray-950 border-b md:border-b-0 md:border-r border-white/10 relative overflow-hidden group`}>
                   {result?.coordinates ? (
                     <MapContainer 
                       center={mapCenter} 
@@ -851,7 +881,7 @@ export default function App() {
                </div>
 
                {/* Data Visualization */}
-               <div className="flex-1 p-4 flex flex-wrap gap-6 items-center bg-gradient-to-r from-transparent to-white/5">
+               <div className="flex-1 p-4 flex flex-wrap gap-4 md:gap-6 items-center bg-gradient-to-r from-transparent to-white/5">
                   <div className="space-y-1">
                      <span className="text-[9px] text-gray-500 uppercase font-bold tracking-widest block">System Context</span>
                      <span className="text-lg font-light text-white block">
@@ -915,11 +945,17 @@ export default function App() {
           </div>
 
           {/* Main Display Area */}
-          <div className="flex-1 relative flex items-center justify-center p-8 overflow-auto custom-scrollbar">
+          <div {...getRootProps({ className: 'flex-1 relative flex items-center justify-center p-4 md:p-8 md:overflow-auto custom-scrollbar' })}>
+            <input {...getInputProps()} />
+            {image && isDragActive && (
+              <div className="absolute inset-4 z-30 border-2 border-dashed border-cyan-500 bg-cyan-500/10 rounded-lg flex items-center justify-center pointer-events-none">
+                <p className="text-base font-semibold tracking-tight uppercase text-cyan-400">Drop to replace the current frame</p>
+              </div>
+            )}
             {!image ? (
               !config.apiKey ? (
                 /* LOCKED Dropzone Empty State */
-                <div className="w-full max-w-2xl h-[400px] border-2 border-dashed border-amber-500/30 rounded-lg bg-amber-500/5 flex flex-col items-center justify-center text-center gap-4 relative overflow-hidden group p-6">
+                <div className="w-full max-w-2xl h-[260px] md:h-[400px] border-2 border-dashed border-amber-500/30 rounded-lg bg-amber-500/5 flex flex-col items-center justify-center text-center gap-4 relative overflow-hidden group p-6">
                   <div className="absolute inset-0 bg-[#000]/30 backdrop-blur-[2px] flex flex-col items-center justify-center gap-4 z-10 p-6">
                     <div className="w-14 h-14 rounded-full border border-amber-500/30 bg-amber-500/10 flex items-center justify-center text-amber-500 shadow-[0_0_15px_rgba(245,158,11,0.2)]">
                       <Key className="w-6 h-6 animate-pulse" />
@@ -941,14 +977,21 @@ export default function App() {
               ) : (
                 /* Active Dropzone empty state */
                 <div 
-                  {...getRootProps()} 
+                  role="button"
+                  tabIndex={0}
+                  onClick={openFilePicker}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      openFilePicker?.();
+                    }
+                  }}
                   className={`
-                    w-full max-w-2xl h-[400px] border-2 border-dashed rounded-lg transition-all 
+                    w-full max-w-2xl h-[260px] md:h-[400px] border-2 border-dashed rounded-lg transition-all 
                     flex flex-col items-center justify-center text-center gap-4 cursor-pointer
                     ${isDragActive ? 'border-cyan-500 bg-cyan-500/5 scale-105' : 'border-white/5 hover:border-white/20 bg-white/2'}
                   `}
                 >
-                  <input {...getInputProps()} />
                   <div className="w-16 h-16 rounded-full border border-white/10 flex items-center justify-center text-gray-700 animate-pulse">
                     <Upload className="w-6 h-6" />
                   </div>
@@ -964,7 +1007,7 @@ export default function App() {
                   <img 
                     src={image} 
                     alt="Target" 
-                    className={`max-w-full max-h-[60vh] rounded-sm shadow-2xl transition-all border border-white/20 ${isAnalyzing ? 'opacity-40 grayscale blur-[2px]' : 'opacity-90'}`} 
+                    className={`max-w-full max-h-[60vh] md:max-h-[min(60vh,calc(100dvh-27rem))] rounded-sm shadow-2xl transition-all border border-white/20 ${isAnalyzing ? 'opacity-40 grayscale blur-[2px]' : 'opacity-90'}`} 
                   />
                   
                   {/* Scanning Overlay */}
@@ -986,16 +1029,27 @@ export default function App() {
                   </AnimatePresence>
 
                   {/* Corner Guards */}
-                  <div className="absolute -top-4 -left-4 w-12 h-12 border-t-2 border-l-2 border-cyan-500/40"></div>
-                  <div className="absolute -bottom-4 -right-4 w-12 h-12 border-b-2 border-r-2 border-cyan-500/40"></div>
+                  <div className="absolute -top-2 -left-2 md:-top-4 md:-left-4 w-12 h-12 border-t-2 border-l-2 border-cyan-500/40"></div>
+                  <div className="absolute -bottom-2 -right-2 md:-bottom-4 md:-right-4 w-12 h-12 border-b-2 border-r-2 border-cyan-500/40"></div>
 
                   <button 
                     onClick={reset}
-                    className="absolute -top-6 -right-6 bg-white/10 hover:bg-red-500/20 p-2 rounded-full text-white/50 hover:text-white transition-all backdrop-blur-md"
+                    title="Clear image"
+                    aria-label="Clear image"
+                    className="absolute -top-4 -right-3 md:-top-6 md:-right-6 bg-white/10 hover:bg-red-500/20 p-2 rounded-full text-white/50 hover:text-white transition-all backdrop-blur-md"
                   >
                     <X className="w-4 h-4" />
                   </button>
                 </div>
+
+                <button
+                  type="button"
+                  onClick={openFilePicker}
+                  disabled={isAnalyzing}
+                  className="mt-8 flex items-center gap-2 px-4 py-2 rounded border border-white/10 bg-white/5 hover:bg-white/10 hover:border-cyan-500/40 text-[10px] font-mono font-bold uppercase tracking-widest text-gray-400 hover:text-cyan-400 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Upload className="w-3.5 h-3.5" /> Upload new photo
+                </button>
 
                 {error && (
                   <motion.div 
@@ -1022,7 +1076,7 @@ export default function App() {
 
         {/* Chat Sidebar */}
         {result && isChatOpen && (
-          <aside className="w-[420px] border-l border-cyan-500/20 bg-[#050505] flex flex-col shrink-0 overflow-hidden z-20 relative">
+          <aside className="fixed inset-0 z-40 md:relative md:inset-auto md:z-20 w-full md:w-[420px] md:border-l border-cyan-500/20 bg-[#050505] flex flex-col shrink-0 overflow-hidden">
             {/* Header */}
             <div className="h-[52px] border-b border-cyan-500/20 bg-cyan-950/20 flex items-center justify-between px-4 shrink-0 relative overflow-hidden">
                <div className="absolute top-0 left-0 w-full h-[1px] bg-cyan-500/30"></div>
@@ -1193,6 +1247,9 @@ export default function App() {
                   <p className="text-amber-500/90">
                     On Google's free tier, submitted images may be used to improve Google products and may be seen by human reviewers. Do not upload sensitive or unpublished material with a free-tier key.
                   </p>
+                  <p className="text-cyan-300/90">
+                    LOCUS requires a key from a project with billing enabled; up to 5,000 search queries per month are free. Google Search and Maps grounding, which LOCUS uses to check locations, is not available on the free tier.
+                  </p>
                   <a 
                     href="https://aistudio.google.com/app/apikey" 
                     target="_blank" 
@@ -1214,7 +1271,7 @@ export default function App() {
                       <input 
                         type={showKey ? 'text' : 'password'}
                         value={apiKeyInput}
-                        onChange={e => setApiKeyInput(e.target.value)}
+                        onChange={e => { setApiKeyInput(e.target.value); setKeyInputError(null); }}
                         placeholder="AIzaSy..."
                         autoComplete="off"
                         spellCheck={false}
@@ -1232,7 +1289,7 @@ export default function App() {
                         {apiKeyInput && (
                           <button
                             type="button"
-                            onClick={() => setApiKeyInput('')}
+                            onClick={() => { setApiKeyInput(''); setKeyInputError(null); }}
                             className="p-1 text-gray-500 hover:text-red-400"
                             title="Clear field to paste another key"
                           >
@@ -1241,6 +1298,9 @@ export default function App() {
                         )}
                       </div>
                     </div>
+                    {keyInputError && (
+                      <p role="alert" className="text-[11px] font-mono text-red-400">{keyInputError}</p>
+                    )}
                     {config.apiKey && (
                       <p className="text-[10px] font-mono text-gray-600">
                         Active key: {keyHint(config.apiKey) || 'set'}. To switch keys, clear the field, paste the new key and save.
@@ -1307,8 +1367,14 @@ export default function App() {
                   <button 
                     type="button"
                     onClick={() => {
-                      const trimmedKey = apiKeyInput.trim();
-                      const savedConfig = { apiKey: trimmedKey, modelName: selectedModel, rememberKey: rememberKeyInput };
+                      const cleanKey = normalizeApiKey(apiKeyInput);
+                      if (cleanKey && !hasValidKeyChars(cleanKey)) {
+                        setKeyInputError('The key contains invalid characters (for example Cyrillic letters or other non-Latin characters). Clear the field and paste the key again from Google AI Studio.');
+                        return;
+                      }
+                      setKeyInputError(null);
+                      setApiKeyInput(cleanKey);
+                      const savedConfig = { apiKey: cleanKey, modelName: selectedModel, rememberKey: rememberKeyInput };
                       if (!saveConfig(savedConfig)) {
                         alert('Could not save settings: browser storage is unavailable.');
                         return;
@@ -1332,12 +1398,18 @@ export default function App() {
       </AnimatePresence>
 
       {/* Footer Status Bar */}
-      <footer className="h-10 bg-[#0f0f0f] border-t border-white/10 px-6 flex items-center justify-between shrink-0">
-        <div className="flex gap-6 text-[10px] font-mono text-gray-600 uppercase tracking-tight">
+      <footer className="h-10 bg-[#0f0f0f] border-t border-white/10 px-3 md:px-6 flex items-center justify-between shrink-0">
+        <div className="flex items-center gap-4 md:gap-6 text-[10px] font-mono text-gray-600 uppercase tracking-tight">
           <span>VERSION 0.4</span>
+          <span className="flex items-center gap-2">
+            Donate:
+            <a href="https://buy.stripe.com/cN229pfEm1xj0I8fYY" target="_blank" rel="noopener noreferrer" className="text-gray-400 hover:text-cyan-400 transition-colors">Stripe</a>
+            <span>·</span>
+            <a href="https://www.patreon.com/c/provereno" target="_blank" rel="noopener noreferrer" className="text-gray-400 hover:text-cyan-400 transition-colors">Patreon</a>
+          </span>
         </div>
         <div className="text-[10px] text-gray-600 font-mono uppercase tracking-[0.2em] hidden sm:block">
-          Vibecoded by Pavel "Pogoda" Bannikov for Provereno.Media
+          Pavel "Pogoda" Bannikov for Provereno.Media
         </div>
       </footer>
     </div>

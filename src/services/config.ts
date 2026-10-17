@@ -4,14 +4,20 @@ export interface ModelOption {
   preview?: boolean;
 }
 
-/** Models offered in Settings. All support Grounding with Google Maps and Google Search (checked 2026-10-08). */
+/**
+ * Models offered in Settings. All support Grounding with Google Maps and Google Search.
+ * As of 2026-10-09: Gemini 3.x grounding needs a key from a project with billing enabled
+ * (not available on the free tier), and gemini-2.5-flash is no longer available to new
+ * users, so it is not offered. Saved choices outside this list fall back to DEFAULT_MODEL.
+ */
 export const MODEL_OPTIONS: readonly ModelOption[] = [
-  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash (recommended)' },
-  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash (legacy)' },
+  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash (recommended)' },
+  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
+  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
   { id: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro (preview, slower, may be withdrawn)', preview: true },
 ];
 
-export const DEFAULT_MODEL = 'gemini-3.8-flash';
+export const DEFAULT_MODEL = 'gemini-3.6-flash';
 
 export interface LocusConfig {
   apiKey: string;
@@ -25,6 +31,23 @@ export const DEFAULT_CONFIG: LocusConfig = { apiKey: '', modelName: DEFAULT_MODE
 const CONFIG_KEY = 'locus_config';
 const SESSION_KEY = 'locus_session_key';
 export const HISTORY_KEY = 'osint_history';
+
+// Whitespace plus invisible characters that come along when a key is copied from
+// chats or documents (zero-width spaces and joiners, word joiner, BOM, soft hyphen).
+const INVISIBLE = /[\s\u200B-\u200D\u2060\uFEFF\u00AD]/g;
+
+/** Removes whitespace and invisible characters picked up when copying a key. */
+export function normalizeApiKey(raw: string): string {
+  return raw.replace(INVISIBLE, '');
+}
+
+/**
+ * Only checks what the browser needs to send the key as a header: visible ASCII.
+ * Key formats differ (e.g. `AIza…`, `AQ.…`), so the exact alphabet is not enforced.
+ */
+export function hasValidKeyChars(key: string): boolean {
+  return /^[\x21-\x7E]+$/.test(key);
+}
 
 export function isKnownModel(id: string): boolean {
   return MODEL_OPTIONS.some((m) => m.id === id);
@@ -45,7 +68,7 @@ export function getConfig(): LocusConfig {
       const parsed = JSON.parse(raw) as Partial<LocusConfig>;
       const rememberKey = parsed.rememberKey !== false;
       return {
-        apiKey: rememberKey ? (typeof parsed.apiKey === 'string' ? parsed.apiKey : '') : readSessionKey(),
+        apiKey: normalizeApiKey(rememberKey ? (typeof parsed.apiKey === 'string' ? parsed.apiKey : '') : readSessionKey()),
         modelName:
           typeof parsed.modelName === 'string' && isKnownModel(parsed.modelName)
             ? parsed.modelName
@@ -56,7 +79,7 @@ export function getConfig(): LocusConfig {
   } catch (e) {
     console.error('Could not read settings from localStorage', e);
   }
-  return { ...DEFAULT_CONFIG, apiKey: readSessionKey() };
+  return { ...DEFAULT_CONFIG, apiKey: normalizeApiKey(readSessionKey()) };
 }
 
 export function saveConfig(config: LocusConfig): boolean {
